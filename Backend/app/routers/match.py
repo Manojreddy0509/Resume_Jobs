@@ -1,84 +1,123 @@
-from fastapi import APIRouter, HTTPException
+# backend/app/routers/match.py
+from fastapi import APIRouter, HTTPException, Depends, Path
 from pydantic import BaseModel
-
-from app.core.config import IN_MEMORY_DB
-from app.services.parser import title_similarity
+from typing import Optional, List
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.db.database import get_db
+from app import crud
+from app.services.matcher import compute_match
+from app.schemas import MatchResult, RankResponse
+import math
 
 router = APIRouter(prefix="/match", tags=["Matching"])
 
+
 class MatchRequest(BaseModel):
-    resume_id: str | None = None
-    job_id: str | None = None
+    resume_id: Optional[str] = None
+    job_id: str
 
-@router.post("/")
-def match_resume_job(payload: MatchRequest):
-    # two modes: resume_id + job_id => single pair
-    # recruiter-style: job_id only => top resumes (handled here if resume_id None)
-    if not payload.job_id:
-        raise HTTPException(status_code=400, detail="job_id is required")
 
-    job = IN_MEMORY_DB["jobs"].get(payload.job_id)
+@router.post("/", response_model=MatchResult)
+async def match_single(payload: MatchRequest, db: AsyncSession = Depends(get_db)):
+    if not payload.resume_id:
+        raise HTTPException(status_code=422, detail="resume_id is required")
+
+    job = await crud.get_job(db, payload.job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
 
-    job_parsed = job["parsed"]
-    job_skills = set(job_parsed.get("required_skills", []))
-    job_title = job_parsed.get("title")
-    job_min_exp = job_parsed.get("min_experience_years")
-
-    results = []
-
-    # If a specific resume_id is provided, only return that match
-    resumes = [ (payload.resume_id, IN_MEMORY_DB["resumes"].get(payload.resume_id)) ] if payload.resume_id else list(IN_MEMORY_DB["resumes"].items())
-
-    for rid, rdata in resumes:
-        if rdata is None:
-            continue
-        parsed = rdata["parsed"]
-        resume_skills = set(parsed.get("skills", []))
-        resume_title = parsed.get("title")
-        resume_exp = parsed.get("experience_years")
-
-        # skill score (Jaccard)
-        union = job_skills.union(resume_skills)
-        inter = job_skills.intersection(resume_skills)
-        skill_score = (len(inter) / len(union)) if union else 0.0
-
-        # title similarity (SequenceMatcher)
-        title_score = title_similarity(job_title or "", resume_title or "")
-
-        # experience score
-        exp_score = 0.0
-        if job_min_exp is None or resume_exp is None:
-            exp_score = 0.5  # neutral when missing
-        else:
-            # if resume_exp >= job_min_exp => 1.0 else fraction (resume_exp / job_min_exp)
-            exp_score = 1.0 if resume_exp >= job_min_exp else (resume_exp / job_min_exp)
-
-        # final weighted score
-        final_score = 0.6 * skill_score + 0.25 * title_score + 0.15 * exp_score
-
-        results.append({
-            "resume_id": rid,
-            "filename": rdata.get("filename"),
-            "score": round(final_score, 4),
-            "breakdown": {
-                "skill_score": round(skill_score, 4),
-                "title_score": round(title_score, 4),
-                "experience_score": round(exp_score, 4)
-            },
-            "matched_skills": sorted(list(inter)),
-            "missing_skills": sorted(list(job_skills - resume_skills))
-        })
-
-    # sort by score desc
-    results = sorted(results, key=lambda x: x["score"], reverse=True)
-
-    # If single resume requested, return single result
-    if payload.resume_id:
-        if results:
-            return results[0]
+    resume = await crud.get_resume(db, payload.resume_id)
+    if not resume:
         raise HTTPException(status_code=404, detail="resume not found")
 
-    # recruiter-style: return top-k (k=10)
-    return {"job_id": payload.job_id, "results": results[:10]}
+    job_parsed = job.parsed or {}
+    resume_parsed = resume.parsed or {}
+
+    final_score, breakdown, reasons, missing_skills = compute_match(
+        resume_parsed=resume_parsed,
+        job_parsed=job_parsed,
+        resume_embedding=resume.embedding or [],
+        job_embedding=job.embedding or [],
+    )
+
+    # persist match for analytics (best-effort)
+    try:
+        await crud.create_match(db, resume_id=resume.id, job_id=job.id, score=final_score, breakdown=breakdown)
+    except Exception:
+        pass
+
+    # human summary label
+    if final_score >= 0.7:
+        label = "Excellent match"
+    elif final_score >= 0.5:
+        label = "Good match"
+    elif final_score >= 0.35:
+        label = "Partial match"
+    else:
+        label = "Low match"
+
+    return MatchResult(
+        resume_id=resume.id,
+        filename=resume.filename,
+        score=round(final_score, 4),
+        breakdown=breakdown,
+        reasons=reasons,
+        missing_skills=missing_skills,
+        label=label,
+    )
+
+
+@router.post("/job/{job_id}", response_model=RankResponse)
+async def rank_job(
+    job_id: str = Path(..., description="Job id to rank resumes for"),
+    limit: Optional[int] = 50,
+    db: AsyncSession = Depends(get_db),
+):
+    job = await crud.get_job(db, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    job_parsed = job.parsed or {}
+    resumes = await crud.get_all_resumes(db, limit=500)
+    if not resumes:
+        return RankResponse(job_id=job_id, results=[])
+
+    results = []
+    for resume in resumes:
+        resume_parsed = resume.parsed or {}
+        final_score, breakdown, reasons, missing_skills = compute_match(
+            resume_parsed=resume_parsed,
+            job_parsed=job_parsed,
+            resume_embedding=resume.embedding or [],
+            job_embedding=job.embedding or [],
+        )
+
+        # determine label per resume (same bands)
+        if final_score >= 0.7:
+            label = "Excellent match"
+        elif final_score >= 0.5:
+            label = "Good match"
+        elif final_score >= 0.35:
+            label = "Partial match"
+        else:
+            label = "Low match"
+
+        results.append(
+            {
+                "resume_id": resume.id,
+                "filename": resume.filename,
+                "score": round(final_score, 4),
+                "breakdown": breakdown,
+                "reasons": reasons,
+                "missing_skills": missing_skills,
+                "label": label,
+            }
+        )
+
+        try:
+            await crud.create_match(db, resume_id=resume.id, job_id=job_id, score=final_score, breakdown=breakdown)
+        except Exception:
+            pass
+
+    sorted_results = sorted(results, key=lambda r: r["score"], reverse=True)[:limit]
+    return RankResponse(job_id=job_id, results=sorted_results)

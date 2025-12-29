@@ -32,7 +32,13 @@ COMMON_SKILLS = [
 
     # Tools & Misc
     "git", "linux", "bash", "rest api", "graphql",
-    "microservices", "system design"
+    "microservices", "system design",
+    "jira", "confluence", "excel", "word", "powerpoint",
+    
+    # Soft Skills / Methodologies
+    "agile", "scrum", "kanban",
+    "communication", "teamwork", "leadership", "problem solving",
+    "unit testing", "testing", "debugging"
 ]
 
 # synonym map for quick normalization

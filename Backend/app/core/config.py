@@ -1,7 +1,21 @@
+# backend/app/core/config.py
 
-from typing import Dict
+from pydantic_settings import BaseSettings
 
-IN_MEMORY_DB = {
-    "resumes": {},  # resume_id -> {filename, text, parsed}
-    "jobs": {}      # job_id -> {title, jd_text, parsed}
-}
+
+class Settings(BaseSettings):
+    # Database
+    database_url: str
+
+    # OpenRouter / Embeddings
+    openrouter_api_key: str
+    openai_embed_model: str = "text-embedding-3-small"
+
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
+        extra = "forbid"   # <--- IMPORTANT (default strict behavior)
+
+
+settings = Settings()
+

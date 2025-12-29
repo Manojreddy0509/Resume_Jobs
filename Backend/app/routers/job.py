@@ -1,38 +1,58 @@
-from fastapi import APIRouter, HTTPException
+# backend/app/routers/job.py (replace create_job function / file as needed)
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
-import uuid
-
+from typing import Optional
 from app.services.parser import extract_skills, extract_title, estimate_experience_years
-from app.core.config import IN_MEMORY_DB
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.db.database import get_db
+from app import crud
+from app.services.embeddings import embed_job_text
+from typing import List
 
 router = APIRouter(prefix="/jobs", tags=["Jobs"])
 
-class JobCreate(BaseModel):
-    title: str | None = None
+class JobCreatePayload(BaseModel):
+    title: Optional[str] = None
     description: str
-    min_experience_years: int | None = None
+    min_experience_years: Optional[int] = None
+
+@router.get("/")
+async def list_jobs(db: AsyncSession = Depends(get_db)):
+    """
+    List all jobs for the dashboard.
+    """
+    jobs = await crud.get_all_jobs(db, limit=100)
+    return jobs
 
 @router.post("/")
-def create_job(payload: JobCreate):
-    if not payload.description or not payload.description.strip():
-        raise HTTPException(status_code=400, detail="description is required")
+async def create_job(payload: JobCreatePayload, db: AsyncSession = Depends(get_db)):
+    if not payload.description.strip():
+        raise HTTPException(status_code=400, detail="description required")
 
-    jd_text = payload.description
-    # parse skills and title heuristically
     parsed = {
-        "title": payload.title or extract_title(jd_text),
-        "required_skills": extract_skills(jd_text),
-        "min_experience_years": payload.min_experience_years or estimate_experience_years(jd_text)
+        "title": payload.title or extract_title(payload.description),
+        "required_skills": extract_skills(payload.description),
+        "min_experience_years": payload.min_experience_years or estimate_experience_years(payload.description)
     }
 
-    job_id = str(uuid.uuid4())
-    IN_MEMORY_DB["jobs"][job_id] = {
-        "title": parsed["title"],
-        "jd_text": jd_text,
-        "parsed": parsed
-    }
+    j = await crud.create_job(db, title=parsed["title"], jd_text=payload.description, parsed=parsed)
 
-    return {
-        "job_id": job_id,
-        "parsed": parsed
-    }
+    # prepare normalized job text for embedding
+    job_text = (
+        f"Job Title: {parsed['title']}\n"
+        f"Required Skills: {', '.join(parsed.get('required_skills') or [])}\n"
+        f"Experience Required: {parsed.get('min_experience_years')}\n\n"
+        f"Job Description:\n{payload.description[:3000]}"
+    )
+
+    try:
+        emb = await embed_job_text(job_text, parsed)
+        if emb:
+            await crud.update_job_embedding(db, j.id, emb)
+        else:
+            print("job embedding returned empty for", j.id)
+    except Exception as e:
+        print("Embedding error (job):", e)
+
+    job = await crud.get_job(db, j.id)
+    return {"job_id": job.id, "parsed": job.parsed}

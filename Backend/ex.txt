@@ -5,3 +5,15 @@ source venv/bin/activate
 uvicorn app.main:app --reload
 pip install pypdf
 pip install -r requirements.txt
+docker compose up -d
+pip install pydantic-settings
+pip install greenlet
+pip install openai numpy
+pip install python-dotenv
+# to enter database then run sql command exit psql \q
+psql -U resume_user -d resume_db
+pip install pgvector
+
+
+
+
